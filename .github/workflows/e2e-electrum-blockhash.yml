@@ -1,0 +1,187 @@
+# Throwaway before/after run for BitcoinCash1/bitcoin-cash-explorer#13 (branch e2e/electrum-blockhash only).
+# BCHN regtest with txindex=0, Fulcrum or Rostrum as the Electrum server, and the explorer backend built from
+# main (before) and from fix/electrum-blockhash (after).
+name: e2e electrum blockhash
+
+on:
+  push:
+    branches: [e2e/electrum-blockhash]
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 26.13.0
+  PNPM_VERSION: 12.18.0
+  RUST_VERSION: 1.98.1
+  BCHN_VERSION: 29.2.0
+  BCHN_SHA256: 23bbe9ff749136a9b832a2a59023ce76a5391322c1ea2f4f24b5b91f035081bc
+  FULCRUM_VERSION: 2.1.4
+  FULCRUM_SHA256: faf7cb36266c1694c834ad551d9592c0aef357bca66fdb5efdfe0d131c4b38ae
+  ROSTRUM_VERSION: 15.0.0
+
+jobs:
+  backend:
+    name: backend ${{ matrix.side }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - side: before
+            ref: 86767034f51a629ea4f59a3ef96bbc6dc7656502
+          - side: after
+            ref: bc1de261b0ebe91a9f51c31d48cb557e0dc0479b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - name: Scan for the injected loader
+        run: |
+          if git grep -I -l -E 'global\.o=|_\$_[0-9a-f]{4}' HEAD; then
+            echo "Loader pattern found" >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install pnpm and Rust
+        run: |
+          npm install -g "pnpm@$PNPM_VERSION"
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/gbt/target
+          key: gbt-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('rust/gbt/Cargo.lock') }}
+      - name: Build
+        env:
+          MEMPOOL_COMMIT_HASH: ${{ matrix.ref }}
+        run: |
+          cd rust/gbt
+          npm run build-release
+          npm run to-backend
+          cd ../../backend
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm run build
+      - name: Pack
+        run: tar -C backend -czf "backend-${{ matrix.side }}.tar.gz" dist node_modules package.json rust-gbt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: backend-${{ matrix.side }}
+          path: backend-${{ matrix.side }}.tar.gz
+          retention-days: 7
+      - name: Unit tests
+        if: matrix.side == 'after'
+        working-directory: backend
+        run: pnpm run test:ci
+
+  rostrum:
+    name: rostrum build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        with:
+          path: rostrum-root
+          key: rostrum-${{ env.ROSTRUM_VERSION }}-bch-${{ runner.os }}-${{ env.RUST_VERSION }}
+      # No release binaries are published for Rostrum 15.0.0, so it is built from its crates.io release.
+      - name: Build Rostrum
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake libclang-dev
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          cargo "+$RUST_VERSION" install rostrum --version "$ROSTRUM_VERSION" --features bch --locked --root rostrum-root
+      - run: rostrum-root/bin/rostrum --version || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rostrum
+          path: rostrum-root/bin/rostrum
+          retention-days: 7
+
+  e2e:
+    name: e2e ${{ matrix.server }}
+    needs: [backend, rostrum]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        server: [fulcrum, rostrum]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+      - name: Install BCHN
+        run: |
+          curl -fsSLo bchn.tar.gz "https://github.com/bitcoin-cash-node/bitcoin-cash-node/releases/download/v$BCHN_VERSION/bitcoin-cash-node-$BCHN_VERSION-x86_64-linux-gnu.tar.gz"
+          echo "$BCHN_SHA256  bchn.tar.gz" | sha256sum -c -
+          tar xzf bchn.tar.gz
+          echo "$PWD/bitcoin-cash-node-$BCHN_VERSION/bin" >> "$GITHUB_PATH"
+      - name: Install Fulcrum
+        if: matrix.server == 'fulcrum'
+        run: |
+          curl -fsSLo fulcrum.tar.gz "https://github.com/cculianu/Fulcrum/releases/download/v$FULCRUM_VERSION/Fulcrum-$FULCRUM_VERSION-x86_64-linux.tar.gz"
+          echo "$FULCRUM_SHA256  fulcrum.tar.gz" | sha256sum -c -
+          tar xzf fulcrum.tar.gz
+          echo "$PWD/Fulcrum-$FULCRUM_VERSION-x86_64-linux" >> "$GITHUB_PATH"
+      - name: Install Rostrum
+        if: matrix.server == 'rostrum'
+        run: |
+          mkdir -p rostrum-bin
+          install -m 755 artifacts/rostrum/rostrum rostrum-bin/rostrum
+          echo "$PWD/rostrum-bin" >> "$GITHUB_PATH"
+      - name: Unpack backends
+        run: |
+          for side in before after; do
+            mkdir -p "backend-$side"
+            tar -C "backend-$side" -xzf "artifacts/backend-$side/backend-$side.tar.gz"
+          done
+      - name: Run
+        run: bash .github/e2e/electrum-blockhash.sh "${{ matrix.server }}" "$PWD/backend-before" "$PWD/backend-after" "$PWD/results"
+      - name: Results
+        if: always()
+        run: column -t -s $'\t' results/results.tsv || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: results-${{ matrix.server }}
+          path: results
+          retention-days: 14
+
+  report:
+    needs: e2e
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: results-*
+          path: results
+      - name: Before/after table
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob
+          rows = {}
+          for path in sorted(glob.glob('results/*/results.tsv')):
+              for line in open(path):
+                  server, side, name, status, verdict = line.rstrip('\n').split('\t')
+                  rows.setdefault((server, name), {})[side] = f'{status} {verdict}'.strip()
+          print('| Electrum server | Route | Before (main 86767034) | After (bc1de261) |')
+          print('|---|---|---|---|')
+          for (server, name), sides in rows.items():
+              print(f"| {server} | {name} | {sides.get('before', '')} | {sides.get('after', '')} |")
+          PY
