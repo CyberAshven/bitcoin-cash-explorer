@@ -61,6 +61,7 @@ X=$(cli getnewaddress)
 Y=$(cli getnewaddress)
 Z=$(cli getnewaddress)
 W=$(cli getnewaddress)
+U=$(cli getnewaddress)
 cli generatetoaddress 101 "$MINER" >/dev/null
 
 # T1 pays X and Y from a mature coinbase; T2 spends both outputs, so no output of T1 stays unspent.
@@ -81,6 +82,8 @@ T2=$(cli sendrawtransaction "$(cli signrawtransactionwithwallet "$RAW2" | jq -r 
 cli generatetoaddress 1 "$MINER" >/dev/null
 H2=$(cli getblockcount)
 cli generatetoaddress 2 "$MINER" >/dev/null
+# Keep T2's output to Z unspent: M must not pick it as an input.
+cli lockunspent false "[{\"txid\":\"$T2\",\"vout\":0}]" >/dev/null
 M=$(cli sendtoaddress "$W" 1)
 TIP=$(cli getblockcount)
 
@@ -91,6 +94,7 @@ TIP=$(cli getblockcount)
   echo "M  $M (mempool)"
   echo "X $X"
   echo "Z $Z"
+  echo "U $U (never used)"
   echo "getrawtransaction T1 without a block hash: $(cli getrawtransaction "$T1" 1 2>&1 | head -c 200 | tr '\n' ' ')"
   echo "getrawtransaction T1 with its block hash: $(cli getrawtransaction "$T1" 1 "$B1" | jq -c '{txid, blockhash, confirmations}')"
 } | tee "$OUT/$SERVER-chain.txt"
@@ -114,7 +118,8 @@ EOF
     ;;
   rostrum)
     ELECTRUM_PORT=60401
-    rostrum --network regtest --db-dir "$WORK/rostrum" --auth e2e:e2e \
+    # Rostrum reads ROSTRUM_* environment variables as settings, so keep the workflow's own out of its sight.
+    env -u ROSTRUM_RELEASE rostrum --network regtest --db-dir "$WORK/rostrum" --auth e2e:e2e \
       --electrum-rpc-addr "127.0.0.1:$ELECTRUM_PORT" -vv >"$OUT/$SERVER-server.log" 2>&1 &
     ;;
   *)
@@ -131,11 +136,12 @@ wait_for 300 "$SERVER at height $TIP" electrum_at_tip
 } | tee -a "$OUT/$SERVER-chain.txt"
 
 # --- Explorer backend, before and after ---------------------------------------------------------------------
-check() { # <side> <name> <API path> <jq condition on a 200 reply> [optional]
-  local side=$1 name=$2 path=$3 filter=$4 required=${5:-required}
+check() { # <side> <name> <API path> <jq condition on a 200 reply> [jq input option, -Rs for a text reply]
+  local side=$1 name=$2 path=$3 filter=$4 input=${5:-}
   local body="$OUT/$SERVER-$side-${name// /_}.json" status verdict
   status=$(curl -s -o "$body" -w '%{http_code}' "$API/$path")
-  if [ "$status" = 200 ] && jq -e --arg T1 "$T1" --arg T2 "$T2" --arg M "$M" --arg B1 "$B1" \
+  # shellcheck disable=SC2086
+  if [ "$status" = 200 ] && jq -e $input --arg T1 "$T1" --arg T2 "$T2" --arg M "$M" --arg B1 "$B1" --arg HEX "$SIGNED1" \
     --argjson H1 "$H1" --argjson H2 "$H2" "$filter" "$body" >/dev/null 2>&1; then
     verdict=ok
   elif [ "$status" = 200 ]; then
@@ -145,7 +151,7 @@ check() { # <side> <name> <API path> <jq condition on a 200 reply> [optional]
   fi
   printf '%s\t%s\t%s\t%s\t%s\n' "$SERVER" "$side" "$name" "$status" "$verdict" >>"$OUT/results.tsv"
   echo "[$SERVER $side] $name: $status $verdict"
-  if [ "$side" = after ] && [ "$required" = required ] && [ "$verdict" != ok ]; then FAILED=1; fi
+  if [ "$side" = after ] && [ "$verdict" != ok ]; then FAILED=1; fi
 }
 
 run_side() { # <side> <backend dir>
@@ -182,19 +188,23 @@ EOF
     "$([ "$tip" = "$TIP" ] && echo "at tip $TIP" || echo "not at tip $TIP: $tip")" >>"$OUT/results.tsv"
   [ "$tip" = "$TIP" ] || { [ "$side" = before ] || FAILED=1; }
 
-  local x=${X#*:} z=${Z#*:}
+  local x=${X#*:} z=${Z#*:} u=${U#*:}
   check "$side" "tx (fully spent)" "tx/$T1" \
     '.txid == $T1 and .status.confirmed and .status.block_height == $H1 and .status.block_hash == $B1 and .fee == 10000 and (.vout | length) == 2'
   check "$side" "tx (unspent output)" "tx/$T2" \
     '.txid == $T2 and .status.confirmed and .status.block_height == $H2 and .fee == 10000'
   check "$side" "tx (mempool)" "tx/$M" '.txid == $M and (.status.confirmed | not)'
+  check "$side" "tx hex (fully spent)" "tx/$T1/hex" 'rtrimstr("\n") == $HEX' -Rs
   check "$side" "outspends" "tx/$T1/outspends" '. == [{"spent": true}, {"spent": true}]'
+  # The spender search reads history from the output's height and each candidate from the node
+  check "$side" "outspend spender" "tx/$T1/outspend/0" '.spent and .txid == $T2 and .vin == 0'
   check "$side" "merkle proof" "tx/$T1/merkle-proof" \
     '.block_height == $H1 and (.merkle | type) == "array" and (.pos | type) == "number"'
   check "$side" "address txs" "address/$x/txs" '[.[].txid] == [$T2, $T1]'
-  # Rostrum takes get_history heights as a filter object, not as the positional from/to the paged route sends.
+  # Paged history asks get_history by heights, which Rostrum takes as a filter object and Fulcrum as positions
   check "$side" "address transactions (paged)" "address/$x/transactions" \
-    '[.transactions[].txid] == [$T2, $T1] and .complete' "$([ "$SERVER" = rostrum ] && echo optional || echo required)"
+    '[.transactions[].txid] == [$T2, $T1] and .complete'
+  check "$side" "address transactions (unused)" "address/$u/transactions" '.transactions == [] and .complete'
   check "$side" "address utxo" "address/$z/utxo" \
     'length == 1 and .[0].txid == $T2 and .[0].status.confirmed and .[0].status.block_height == $H2'
 
