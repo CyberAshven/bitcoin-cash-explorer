@@ -220,56 +220,20 @@ class P2PBackendApi extends BitcoinApi implements AbstractBitcoinApi {
   /**
    * The block of a transaction the node did not find by its id alone (it
    * keeps no transaction index, or the transaction is confirmed and fully
-   * spent), from the transaction's key in the filters; undefined when the
-   * error is another or the filters do not hold the transaction.
+   * spent), from the transaction's key in the filters; empty when the
+   * filters do not hold the transaction. BitcoinApi reads the transaction
+   * and its hex again from this block.
    */
-  private async blockOfMissingTx(txId: string, error: any): Promise<string | undefined> {
-    const notFound = error?.code === -5 || /No such mempool or blockchain transaction/.test(error?.message ?? '');
-    if (!notFound || !/^[0-9a-fA-F]{64}$/.test(txId)) {
-      return undefined;
+  protected async $findBlockHash(txId: string): Promise<string> {
+    if (!/^[0-9a-fA-F]{64}$/.test(txId)) {
+      return '';
     }
     await this.started;
     await this.client.refresh();
     if (!this.client.synced) {
       throw new HistoryBusyError('Filters are still being downloaded from the node');
     }
-    return (await this.client.locateTx(fromDisplay(txId)))?.blockHash;
-  }
-
-  async $getRawTransaction(
-    txId: string,
-    skipConversion = false,
-    addPrevout = false,
-    lazyPrevouts = false
-  ): Promise<IPublicApi.VerboseTransaction | IBitcoinApi.VerboseTransaction> {
-    try {
-      return await super.$getRawTransaction(txId, skipConversion, addPrevout, lazyPrevouts);
-    } catch (e) {
-      const blockHash = await this.blockOfMissingTx(txId, e);
-      if (!blockHash) {
-        throw e;
-      }
-      const tx: IBitcoinApi.VerboseTransaction = await this.bitcoindClient.getRawTransaction(txId, 2, blockHash, true);
-      if (skipConversion) {
-        tx.vout.forEach((vout) => {
-          vout.value = Math.round(vout.value * 100000000);
-        });
-        return tx;
-      }
-      return this.$convertTransaction(tx, addPrevout, lazyPrevouts);
-    }
-  }
-
-  async $getTransactionHex(txId: string): Promise<string> {
-    try {
-      return await super.$getTransactionHex(txId);
-    } catch (e) {
-      const blockHash = await this.blockOfMissingTx(txId, e);
-      if (!blockHash) {
-        throw e;
-      }
-      return (await this.bitcoindClient.getRawTransaction(txId, true, blockHash)).hex;
-    }
+    return (await this.client.locateTx(fromDisplay(txId)))?.blockHash ?? '';
   }
 
   async $getCoinbaseTx(blockhash: string): Promise<IPublicApi.VerboseTransaction> {

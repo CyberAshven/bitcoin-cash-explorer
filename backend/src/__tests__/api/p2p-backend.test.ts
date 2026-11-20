@@ -517,6 +517,28 @@ test('a transaction is found by its txid alone, from its key in the filters, in 
   await expect(api.$getRawTransaction('ab'.repeat(32))).rejects.toThrow('No such mempool or blockchain transaction');
 });
 
+test('a block hash the caller knows, as block processing passes it, reads the transaction without the filters', async () => {
+  const txid = toDisplay(chain.blocks[2].txs[0].txid);
+  const blockHash = toDisplay(chain.blocks[2].hash);
+  const locate = jest.spyOn(client, 'locateTx');
+  try {
+    const shown = (await api.$getRawTransaction(txid, false, false, false, blockHash)) as any;
+    expect(shown.status).toMatchObject({ confirmed: true, block_height: 2, block_hash: blockHash });
+    expect(
+      rpc.calls
+        .filter((c) => c.method === 'getrawtransaction')
+        .slice(-2)
+        .map((c) => c.params)
+    ).toEqual([
+      [txid, 2, ''],
+      [txid, 2, blockHash],
+    ]);
+    expect(locate).not.toHaveBeenCalled();
+  } finally {
+    locate.mockRestore();
+  }
+});
+
 test('a reader of the store sees what the writer committed and gives the same histories', async () => {
   await reader.refresh();
   expect(reader.tipHeight).toBe(store.tipHeight);

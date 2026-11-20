@@ -270,6 +270,29 @@ test('a transaction the Electrum server cannot place keeps the node error', asyn
   expect(blockHashLookups().map((request) => request.params)).toEqual([[unknown]]);
 });
 
+test('a not found answer that carries only the message is read again from the block', async () => {
+  node.getRawTransaction.mockRejectedValueOnce(new Error('No such mempool or blockchain transaction'));
+  const tx: any = await api.$getRawTransaction(funding);
+  expect(tx.status.block_height).toBe(5);
+  expect(node.getRawTransaction.mock.calls).toEqual([
+    [funding, 2, '', true],
+    [funding, 2, blockHash(5), true],
+  ]);
+});
+
+test('the genesis coinbase is built from its block without an Electrum lookup', async () => {
+  const message = 'The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved';
+  node.getRawTransaction.mockRejectedValueOnce(Object.assign(new Error(message), { code: -5 }));
+  const genesis = jest.spyOn(api as any, '$returnCoinbaseTransaction').mockResolvedValue({ txid: 'genesis' });
+  try {
+    expect(await api.$getRawTransaction(unknown)).toEqual({ txid: 'genesis' });
+    expect(node.getRawTransaction).toHaveBeenCalledTimes(1);
+    expect(blockHashLookups()).toHaveLength(0);
+  } finally {
+    genesis.mockRestore();
+  }
+});
+
 test.each([true, false])('a block hash the caller knows needs no Electrum lookup (txindex %s)', async (index) => {
   txindex = index;
   const tx: any = await api.$getRawTransaction(funding, false, false, false, blockHash(5));
