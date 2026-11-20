@@ -193,7 +193,7 @@ class BitcoinApi implements AbstractBitcoinApi {
   async $getAddressSummary(
     _target: string,
     _scriptHash = false
-  ): Promise<{ address: string; confirmedBalance: number; pendingBalance: number; electrum: true }> {
+  ): Promise<{ address: string; confirmedBalance: number; pendingBalance: number; electrum: boolean }> {
     throw Object.assign(new Error('Address pagination requires Electrum'), { status: 405 });
   }
   async $getAddressPage(
@@ -586,7 +586,12 @@ class BitcoinApi implements AbstractBitcoinApi {
     try {
       return await read('');
     } catch (e) {
-      if ((e as { code?: number })?.code !== -5) {
+      const { code, message = '' } = (e ?? {}) as { code?: number; message?: string };
+      // The genesis coinbase answers -5 in any block; $getRawTransaction builds it from the block instead
+      if (
+        (code !== -5 && !/No such mempool or blockchain transaction/.test(message)) ||
+        message.startsWith('The genesis block coinbase')
+      ) {
         throw e;
       }
       const hash =
