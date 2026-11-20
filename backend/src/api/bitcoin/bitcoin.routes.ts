@@ -686,7 +686,14 @@ class BitcoinRoutes {
       const endIndex = Math.min(startingIndex + 10, txIds.length);
       for (let i = startingIndex; i < endIndex; i++) {
         try {
-          const transaction = await transactionUtils.$getTransactionExtended(txIds[i], true, true);
+          const transaction = await transactionUtils.$getTransactionExtended(
+            txIds[i],
+            true,
+            true,
+            false,
+            false,
+            req.params.hash
+          );
           const nonVerboseTransaction = transactionUtils.stripVerbosityFromTransaction(transaction);
           transactions.push(nonVerboseTransaction);
           loadingIndicators.setProgress(

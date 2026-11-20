@@ -7,13 +7,18 @@ export interface BlockTransactionFetchOptions {
   reusePrevouts?: boolean;
 }
 
+// The hash of the block a confirmed transaction is in, when the caller knows it, or a function that looks it up.
+// A node without a transaction index needs it to read a transaction that has no unspent output left.
+export type KnownBlockHash = string | (() => Promise<string>);
+
 export interface AbstractBitcoinApi {
   $getRawMempool(): Promise<IPublicApi.Transaction['txid'][]>;
   $getRawTransaction(
     txId: string,
     skipConversion?: boolean,
     addPrevout?: boolean,
-    lazyPrevouts?: boolean
+    lazyPrevouts?: boolean,
+    blockHash?: KnownBlockHash
   ): Promise<IPublicApi.VerboseTransaction | IBitcoinApi.VerboseTransaction>;
   $getRawTransactions(txids: string[]): Promise<IPublicApi.VerboseTransaction[]>;
   $getMempoolTransactions(txids: string[]): Promise<IPublicApi.Transaction[]>;

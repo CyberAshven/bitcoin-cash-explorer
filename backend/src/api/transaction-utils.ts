@@ -177,6 +177,7 @@ class TransactionUtils {
    * @param lazyPrevouts
    * @param forceCore
    * @param addMempoolData
+   * @param blockHash - The block the transaction is in, if known
    * @returns Promise<TransactionExtended>
    */
   public async $getTransactionExtendedRetry(
@@ -184,10 +185,18 @@ class TransactionUtils {
     addPrevouts = false,
     lazyPrevouts = false,
     forceCore = false,
-    addMempoolData = false
+    addMempoolData = false,
+    blockHash = ''
   ): Promise<VerboseTransactionExtended> {
     try {
-      const result = await this.$getTransactionExtended(txid, addPrevouts, lazyPrevouts, forceCore, addMempoolData);
+      const result = await this.$getTransactionExtended(
+        txid,
+        addPrevouts,
+        lazyPrevouts,
+        forceCore,
+        addMempoolData,
+        blockHash
+      );
       if (result) {
         return result;
       } else {
@@ -197,7 +206,7 @@ class TransactionUtils {
       logger.err(`Cannot fetch tx ${txid}. Reason: ` + (e instanceof Error ? e.message : e));
     }
     // retry direct from Core if first request failed
-    return this.$getTransactionExtended(txid, addPrevouts, lazyPrevouts, true, addMempoolData);
+    return this.$getTransactionExtended(txid, addPrevouts, lazyPrevouts, true, addMempoolData, blockHash);
   }
 
   /**
@@ -206,6 +215,7 @@ class TransactionUtils {
    * @param lazyPrevouts
    * @param forceCore - See https://github.com/mempool/mempool/issues/2904
    * @param addMempoolData
+   * @param blockHash - The block the transaction is in, if known
    * @returns Promise<TransactionExtended>
    */
   public async $getTransactionExtended(
@@ -213,7 +223,8 @@ class TransactionUtils {
     addPrevouts = false,
     lazyPrevouts = false,
     forceCore = false,
-    addMempoolData = false
+    addMempoolData = false,
+    blockHash = ''
   ): Promise<VerboseTransactionExtended> {
     let transaction: IPublicApi.VerboseTransaction;
     if (forceCore === true) {
@@ -221,14 +232,16 @@ class TransactionUtils {
         txId,
         false,
         addPrevouts,
-        lazyPrevouts
+        lazyPrevouts,
+        blockHash
       )) as IPublicApi.VerboseTransaction;
     } else {
       transaction = (await bitcoinApi.$getRawTransaction(
         txId,
         false,
         addPrevouts,
-        lazyPrevouts
+        lazyPrevouts,
+        blockHash
       )) as IPublicApi.VerboseTransaction;
     }
 

@@ -1,5 +1,5 @@
 import { AddressMempoolSummary, AddressPageMetadata, AddressCountPage } from './address-pagination';
-import { AbstractBitcoinApi, BlockTransactionFetchOptions } from './bitcoin-api-abstract-factory';
+import { AbstractBitcoinApi, BlockTransactionFetchOptions, KnownBlockHash } from './bitcoin-api-abstract-factory';
 import { IBitcoinApi, SubmitPackageResult, TestMempoolAcceptResult } from './bitcoin-api.interface';
 import { IPublicApi } from './public-api.interface';
 import blocks from '../blocks';
@@ -52,7 +52,7 @@ class BitcoinApi implements AbstractBitcoinApi {
     skipConversion = false,
     addPrevout = false,
     lazyPrevouts = false,
-    blockHash = ''
+    blockHash: KnownBlockHash = ''
   ): Promise<IPublicApi.VerboseTransaction | IBitcoinApi.VerboseTransaction> {
     // If the transaction is in the mempool we already converted and fetched the fee. Only prevouts are missing
     const txInMempool = mempool.getMempool()[txId];
@@ -60,11 +60,13 @@ class BitcoinApi implements AbstractBitcoinApi {
       return this.$addPrevouts(txInMempool);
     }
 
-    // This is using the convertTransaction with requires verbosity 2 + patterns.
-    // Without a block hash (an empty string) a node finds a confirmed transaction only with a transaction index.
-    return this.bitcoindClient
-      .getRawTransaction(txId, 2, blockHash, true)
-      .then((transaction: IBitcoinApi.VerboseTransaction) => {
+    // This is using the convertTransaction with requires verbosity 2 + patterns
+    return this.$readTransaction<IBitcoinApi.VerboseTransaction>(
+      txId,
+      (hash) => this.bitcoindClient.getRawTransaction(txId, 2, hash, true),
+      blockHash
+    )
+      .then<IPublicApi.VerboseTransaction | IBitcoinApi.VerboseTransaction>((transaction) => {
         if (skipConversion) {
           transaction.vout.forEach((vout) => {
             vout.value = Math.round(vout.value * 100000000);
@@ -108,7 +110,9 @@ class BitcoinApi implements AbstractBitcoinApi {
       return txInMempool.hex;
     }
 
-    return this.bitcoindClient.getRawTransaction(txId, true).then((transaction: IBitcoinApi.VerboseTransaction) => {
+    return this.$readTransaction<IBitcoinApi.VerboseTransaction>(txId, (hash) =>
+      hash ? this.bitcoindClient.getRawTransaction(txId, true, hash) : this.bitcoindClient.getRawTransaction(txId, true)
+    ).then((transaction: IBitcoinApi.VerboseTransaction) => {
       return transaction.hex;
     });
   }
@@ -337,7 +341,7 @@ class BitcoinApi implements AbstractBitcoinApi {
 
   async $getCoinbaseTx(blockhash: string): Promise<IPublicApi.VerboseTransaction> {
     const txids = await this.$getTxIdsForBlock(blockhash);
-    return this.$getRawTransaction(txids[0]) as Promise<IPublicApi.VerboseTransaction>;
+    return this.$getRawTransaction(txids[0], false, false, false, blockhash) as Promise<IPublicApi.VerboseTransaction>;
   }
 
   async $getAddressTransactionSummary(address: string): Promise<IPublicApi.AddressTxSummary[]> {
@@ -569,6 +573,34 @@ class BitcoinApi implements AbstractBitcoinApi {
         );
       })
     );
+  }
+
+  // Reads a transaction from the node without a block hash first, as a node with a transaction index answers that
+  // for any transaction. A node without one finds only mempool transactions and, on BCHN, those with an unspent
+  // output, and answers -5 for the rest: read those from the block the caller knows or $findBlockHash names.
+  protected async $readTransaction<T>(
+    txId: string,
+    read: (blockHash: string) => Promise<T>,
+    blockHash: KnownBlockHash = ''
+  ): Promise<T> {
+    try {
+      return await read('');
+    } catch (e) {
+      if ((e as { code?: number })?.code !== -5) {
+        throw e;
+      }
+      const hash =
+        (typeof blockHash === 'function' ? await blockHash() : blockHash) || (await this.$findBlockHash(txId));
+      if (!hash) {
+        throw e;
+      }
+      return read(hash);
+    }
+  }
+
+  // The node alone cannot tell which block a transaction is in
+  protected async $findBlockHash(_txId: string): Promise<string> {
+    return '';
   }
 
   private $getMempoolEntry(txid: string): Promise<IBitcoinApi.MempoolEntry> {

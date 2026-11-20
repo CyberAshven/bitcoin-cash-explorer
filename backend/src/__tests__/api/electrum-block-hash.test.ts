@@ -16,36 +16,55 @@ jest.mock('../../api/memory-cache', () => ({ __esModule: true, default: { get: (
 jest.mock('../../api/bitcoin/bitcoin-api-factory', () => ({ __esModule: true, default: {}, bitcoinCoreApi: {} }));
 import { createServer, Server, Socket, AddressInfo } from 'node:net';
 import config from '../../config';
-import mempool from '../../api/mempool';
 import BitcoindElectrsApi from '../../api/bitcoin/electrum-api';
 
-// A node without a transaction index: it reads a confirmed transaction only from the block named by its hash
-// and a mempool transaction only without one.
+// A node reads a confirmed transaction without a block hash only with a transaction index (or, on BCHN, while it
+// has an unspent output); without one it answers -5 unless given the block the transaction is in.
 const tip = 10;
 const blockHash = (height: number) => height.toString(16).padStart(64, '0');
 const address = 'qrv4ytx9jweyy095v3rxxysrs2luz5kcrq50kljf27';
-const confirmedAt5 = 'a'.repeat(64);
-const confirmedAt7 = 'b'.repeat(64);
+const funding = 'a'.repeat(64);
+const spending = 'b'.repeat(64);
 const pending = 'c'.repeat(64);
-const heights: Record<string, number> = { [confirmedAt5]: 5, [confirmedAt7]: 7 };
-const raw = (txid: string) => ({
-  txid,
-  version: 2,
-  locktime: 0,
-  size: 100,
-  vin: [{ coinbase: '0101', sequence: 0xffffffff }],
-  vout: [{ value: 0.00001, n: 0, scriptPubKey: { hex: '51', asm: '1', type: 'nonstandard' } }],
-  ...(heights[txid] && { confirmations: tip - heights[txid] + 1, blockhash: blockHash(heights[txid]), blocktime: 1 }),
-});
+const unknown = 'd'.repeat(64);
+const script = { hex: '51', asm: '1', type: 'nonstandard', byteCodePattern: { pattern: '51', data: ['51'] } };
+const transactions: Record<string, { height?: number; vin: any[]; value: number }> = {
+  [funding]: { height: 5, vin: [{ coinbase: '0101', sequence: 0xffffffff }], value: 0.00001 },
+  // Spends the only output of the funding transaction, so no output of it stays unspent
+  [spending]: {
+    height: 7,
+    vin: [
+      { txid: funding, vout: 0, sequence: 0xffffffff, value: 0.00001, scriptSig: { hex: '51' }, scriptPubKey: script },
+    ],
+    value: 0.000009,
+  },
+  [pending]: { vin: [{ coinbase: '0101', sequence: 0xffffffff }], value: 0.00001 },
+};
+const raw = (txid: string) => {
+  const { height, vin, value } = transactions[txid];
+  return {
+    txid,
+    hex: '02' + txid,
+    version: 2,
+    locktime: 0,
+    size: 100,
+    vin: structuredClone(vin),
+    vout: [{ value, n: 0, scriptPubKey: { hex: '51', asm: '1', type: 'nonstandard' } }],
+    ...(height && { confirmations: tip - height + 1, blockhash: blockHash(height), blocktime: 1 }),
+  };
+};
+let txindex = false;
 const node = {
-  validateAddress: jest.fn(async () => ({ isvalid: true, address, scriptPubKey: '76a914' + '00'.repeat(20) + '88ac' })),
+  validateAddress: jest.fn(async () => ({ isvalid: true, address, scriptPubKey: '51' })),
   getBestBlockHash: jest.fn(async () => blockHash(tip)),
   getBlockHash: jest.fn(async (height: number) => blockHash(height)),
   getBlock: jest.fn(async (hash: string) => ({ hash, height: parseInt(hash, 16) })),
-  getRawTransaction: jest.fn(async (txid: string, _verbosity: number, hash: string, _patterns: boolean) => {
-    const found = heights[txid] !== undefined ? hash === blockHash(heights[txid]) : txid === pending && hash === '';
-    if (!found) throw new Error('No such mempool transaction. Use -txindex or provide a block hash.');
-    return raw(txid);
+  getRawTransaction: jest.fn(async (txid: string, _verbosity: number | boolean, hash = '', _patterns?: boolean) => {
+    const tx = transactions[txid];
+    if (tx && hash && tx.height !== undefined && hash === blockHash(tx.height)) return raw(txid);
+    if (tx && !hash && (tx.height === undefined || txindex)) return raw(txid);
+    const message = hash ? 'No such transaction found in the provided block' : 'No such mempool transaction';
+    throw Object.assign(new Error(message), { code: -5 });
   }),
   getMempoolEntry: jest.fn(async () => ({ fees: { base: 0.000001 } })),
   getTxOut: jest.fn(async () => null),
@@ -56,7 +75,6 @@ let api: BitcoindElectrsApi;
 const sockets = new Set<Socket>();
 const requests: { method: string; params: any[] }[] = [];
 const previous = { ...config.ELECTRUM };
-let history: unknown[] = [];
 beforeAll(async () => {
   server = createServer((socket) => {
     sockets.add(socket);
@@ -76,19 +94,22 @@ beforeAll(async () => {
             result = ['Fulcrum mock', '1.6'];
             break;
           case 'blockchain.scripthash.get_first_use':
-            result = { height: 5, block_hash: blockHash(5), tx_hash: confirmedAt5 };
+            result = { height: 5, block_hash: blockHash(5), tx_hash: funding };
             break;
           case 'blockchain.scripthash.get_mempool':
             result = [];
             break;
           case 'blockchain.scripthash.get_history':
-            result = history;
+            result = [
+              { tx_hash: funding, height: 5 },
+              { tx_hash: spending, height: 7 },
+            ];
             break;
           case 'blockchain.transaction.get_merkle':
             result = { block_height: request.params[1], merkle: [], pos: 0 };
             break;
           case 'blockchain.transaction.get_confirmed_blockhash': {
-            const height = heights[request.params[0]];
+            const height = transactions[request.params[0]]?.height;
             if (height !== undefined) {
               result = { block_hash: blockHash(height), block_height: height };
             } else {
@@ -125,70 +146,157 @@ afterAll(async () => {
 });
 beforeEach(() => {
   requests.length = 0;
-  history = [
-    { tx_hash: confirmedAt5, height: 5 },
-    { tx_hash: confirmedAt7, height: 7 },
-  ];
+  txindex = false;
   node.getRawTransaction.mockClear();
-  jest.mocked(mempool.getMempool).mockReturnValue({});
+  node.getBlockHash.mockClear();
   (api as any).historyCoordinator.cache.clear();
 });
 const blockHashLookups = () =>
   requests.filter((request) => request.method === 'blockchain.transaction.get_confirmed_blockhash');
+const historyBlockHeights = () =>
+  node.getBlockHash.mock.calls.map(([height]) => height).filter((height) => height !== tip);
 
-test('address page reads each confirmed history row from the block at its height', async () => {
+test.each([true, false])('address page reads history rows by the block at their height (txindex %s)', async (index) => {
+  txindex = index;
   const page = await api.$getAddressPage(address);
-  expect(page.transactions.map((tx) => [tx.txid, tx.status])).toEqual([
-    [confirmedAt7, { confirmed: true, block_height: 7, block_hash: blockHash(7), block_time: 1 }],
-    [confirmedAt5, { confirmed: true, block_height: 5, block_hash: blockHash(5), block_time: 1 }],
+  expect(page.transactions.map((tx) => [tx.txid, tx.status.block_height, tx.fee])).toEqual([
+    [spending, 7, 100],
+    [funding, 5, 0],
   ]);
-  expect(node.getRawTransaction.mock.calls).toEqual([
-    [confirmedAt7, 2, blockHash(7), true],
-    [confirmedAt5, 2, blockHash(5), true],
-  ]);
+  expect(node.getRawTransaction.mock.calls).toEqual(
+    index
+      ? [
+          [spending, 2, '', true],
+          [funding, 2, '', true],
+        ]
+      : [
+          [spending, 2, '', true],
+          [spending, 2, blockHash(7), true],
+          [funding, 2, '', true],
+          [funding, 2, blockHash(5), true],
+        ]
+  );
+  // The node with a transaction index needs neither a block hash nor the Electrum server
+  expect(historyBlockHeights()).toEqual(index ? [] : [7, 5]);
   expect(blockHashLookups()).toHaveLength(0);
 });
 
-test('address transactions read each confirmed history row from the block at its height', async () => {
+test('address transactions read history rows by the block at their height', async () => {
   const transactions = await api.$getAddressTransactions(address, '');
-  expect(transactions.map((tx) => tx.txid)).toEqual([confirmedAt7, confirmedAt5]);
-  expect(node.getRawTransaction.mock.calls).toEqual([
-    [confirmedAt7, 2, blockHash(7), true],
-    [confirmedAt5, 2, blockHash(5), true],
-  ]);
+  expect(transactions.map((tx) => tx.txid)).toEqual([spending, funding]);
+  expect(historyBlockHeights()).toEqual([7, 5]);
   expect(blockHashLookups()).toHaveLength(0);
 });
 
-test.each([
-  ['transaction', () => api.$getRawTransaction(confirmedAt7, false, true)],
-  ['outspends', () => api.$getOutspends(confirmedAt7)],
-  ['merkle proof', () => api.$getTransactionMerkleProof(confirmedAt7)],
-])('%s of a bare confirmed txid asks the Electrum server for its block', async (_name, call) => {
-  await call();
-  expect(blockHashLookups().map((request) => request.params)).toEqual([[confirmedAt7]]);
-  expect(node.getRawTransaction.mock.calls).toEqual([[confirmedAt7, 2, blockHash(7), true]]);
-});
+const bareTxid: [string, () => Promise<unknown>, any[][], any[][]][] = [
+  [
+    'transaction',
+    () => api.$getRawTransaction(funding, false, true),
+    [[funding, 2, '', true]],
+    [
+      [funding, 2, '', true],
+      [funding, 2, blockHash(5), true],
+    ],
+  ],
+  [
+    'outspends',
+    () => api.$getOutspends(funding),
+    [[funding, 2, '', true]],
+    [
+      [funding, 2, '', true],
+      [funding, 2, blockHash(5), true],
+    ],
+  ],
+  [
+    'merkle proof',
+    () => api.$getTransactionMerkleProof(funding),
+    [[funding, 2, '', true]],
+    [
+      [funding, 2, '', true],
+      [funding, 2, blockHash(5), true],
+    ],
+  ],
+  [
+    'hex',
+    () => api.$getTransactionHex(funding),
+    [[funding, true]],
+    [
+      [funding, true],
+      [funding, true, blockHash(5)],
+    ],
+  ],
+];
+
+test.each(bareTxid)(
+  '%s of a bare txid on a node with a transaction index asks no Electrum server',
+  async (_n, call, calls) => {
+    txindex = true;
+    await call();
+    expect(node.getRawTransaction.mock.calls).toEqual(calls);
+    expect(blockHashLookups()).toHaveLength(0);
+  }
+);
+
+test.each(bareTxid)(
+  '%s of a bare txid on a node without a transaction index asks the Electrum server once for its block',
+  async (_n, call, _calls, calls) => {
+    await call();
+    expect(node.getRawTransaction.mock.calls).toEqual(calls);
+    expect(blockHashLookups().map((request) => request.params)).toEqual([[funding]]);
+  }
+);
 
 test('merkle proof uses the height of the block the node read the transaction from', async () => {
-  await api.$getTransactionMerkleProof(confirmedAt7);
+  expect(await api.$getTransactionMerkleProof(funding)).toEqual({ block_height: 5, merkle: [], pos: 0 });
   expect(requests.find((request) => request.method === 'blockchain.transaction.get_merkle')?.params).toEqual([
-    confirmedAt7,
-    7,
+    funding,
+    5,
   ]);
 });
 
 test('a mempool transaction is read without a block hash or an Electrum lookup', async () => {
-  jest.mocked(mempool.getMempool).mockReturnValue({ [pending]: {} } as any);
   const tx: any = await api.$getRawTransaction(pending);
   expect(tx.status).toEqual({ confirmed: false });
   expect(node.getRawTransaction.mock.calls).toEqual([[pending, 2, '', true]]);
   expect(blockHashLookups()).toHaveLength(0);
 });
 
-test('a transaction the Electrum server cannot place is read without a block hash', async () => {
-  // Not yet in the explorer's mempool, so the Electrum server is asked and answers with an error
-  const tx: any = await api.$getRawTransaction(pending);
-  expect(tx.status).toEqual({ confirmed: false });
-  expect(blockHashLookups().map((request) => request.params)).toEqual([[pending]]);
-  expect(node.getRawTransaction.mock.calls).toEqual([[pending, 2, '', true]]);
+test('a transaction the Electrum server cannot place keeps the node error', async () => {
+  await expect(api.$getRawTransaction(unknown)).rejects.toMatchObject({
+    code: -5,
+    message: 'No such mempool transaction',
+  });
+  expect(node.getRawTransaction.mock.calls).toEqual([[unknown, 2, '', true]]);
+  expect(blockHashLookups().map((request) => request.params)).toEqual([[unknown]]);
+});
+
+test.each([true, false])('a block hash the caller knows needs no Electrum lookup (txindex %s)', async (index) => {
+  txindex = index;
+  const tx: any = await api.$getRawTransaction(funding, false, false, false, blockHash(5));
+  expect(tx.status.block_hash).toBe(blockHash(5));
+  expect(node.getRawTransaction.mock.calls).toEqual(
+    index
+      ? [[funding, 2, '', true]]
+      : [
+          [funding, 2, '', true],
+          [funding, 2, blockHash(5), true],
+        ]
+  );
+  expect(blockHashLookups()).toHaveLength(0);
+});
+
+test.each([true, false])('outspend reads the spender from the node by its history row (txindex %s)', async (index) => {
+  txindex = index;
+  expect(await api.$getOutspend(funding, 0)).toEqual({ spent: true, txid: spending, vin: 0 });
+  expect(node.getRawTransaction.mock.calls.filter(([txid]) => txid === spending)).toEqual(
+    index
+      ? [[spending, 1, '']]
+      : [
+          [spending, 1, ''],
+          [spending, 1, blockHash(7)],
+        ]
+  );
+  expect(requests.some((request) => request.method === 'blockchain.transaction.get')).toBe(false);
+  // Only the bare txid of the spent transaction may need the Electrum server
+  expect(blockHashLookups().map((request) => request.params)).toEqual(index ? [] : [[funding]]);
 });

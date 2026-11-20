@@ -4,7 +4,7 @@ import config from '../../config';
 import { ElectrumClient } from '@bitcoincash/electrum-client';
 import { ElectrumConfig, PersistencePolicy } from '@bitcoincash/electrum-client/dist/types';
 import { createHash } from 'node:crypto';
-import { AbstractBitcoinApi } from './bitcoin-api-abstract-factory';
+import { AbstractBitcoinApi, KnownBlockHash } from './bitcoin-api-abstract-factory';
 import { IPublicApi } from './public-api.interface';
 import { IElectrumApi } from './electrum-api.interface';
 import { IBitcoinApi } from './bitcoin-api.interface';
@@ -12,7 +12,6 @@ import BitcoinApi from './bitcoin-api';
 import logger from '../../logger';
 import loadingIndicators from '../loading-indicators';
 import memoryCache from '../memory-cache';
-import mempool from '../mempool';
 import { compareElectrumHistoryNewestFirst } from './electrum-history';
 
 class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
@@ -85,7 +84,11 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
         hash: (height) => this.$getBlockHash(height),
         firstUse: async (key, snapshotHash) => {
           const first = await this.historyCoordinator.request<any>('first:' + key + ':' + snapshotHash, () =>
-            this.historyRequest('blockchain.scripthash.get_first_use', [key])
+            this.historyRequest('blockchain.scripthash.get_first_use', [key]).catch((e) => {
+              // Rostrum answers an unused script with a not found error (-32004) instead of null
+              if (e?.code === -32004 && this.historyServerIsRostrum()) return null;
+              throw e;
+            })
           );
           // electrum-client 1.2.x returns the whole JSON-RPC envelope for a null
           // result (`msg.result || msg`). get_first_use legitimately returns null
@@ -126,31 +129,38 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
         reject(new Error('Electrum history request timed out'));
       }, 15000);
       void this.historyClient
-        .request(method, params)
+        .request(method, method === 'blockchain.scripthash.get_history' ? this.historyParams(params) : params)
         .then(resolve, reject)
         .finally(() => clearTimeout(timer));
     });
   }
 
-  async $getRawTransaction(
-    txId: string,
-    skipConversion = false,
-    addPrevout = false,
-    lazyPrevouts = false,
-    blockHash?: string
-  ): Promise<IPublicApi.VerboseTransaction | IBitcoinApi.VerboseTransaction> {
-    // A node without a transaction index finds a confirmed transaction only in its block, so ask the Electrum server
-    // for that block. Mempool transactions, and those the Electrum server cannot place, are read without a block hash.
-    if (blockHash === undefined && !mempool.getMempool()[txId]) {
-      blockHash = await this.$getConfirmedBlockHash(txId);
-    }
-    return super.$getRawTransaction(txId, skipConversion, addPrevout, lazyPrevouts, blockHash);
+  // Rostrum takes get_history heights as a filter object and rejects Fulcrum's positional ones. Both mean the same:
+  // from_height inclusive, to_height exclusive, and a missing or -1 to_height includes the mempool.
+  private historyParams(params: any[]): any[] {
+    if (params.length < 2 || !this.historyServerIsRostrum()) return params;
+    const [scriptHash, fromHeight, toHeight] = params;
+    return [scriptHash, { from_height: fromHeight, ...(toHeight !== undefined && { to_height: toHeight }) }];
+  }
+
+  // Rostrum names itself in its server.version reply, e.g. ["Rostrum 15.0.0", "1.4.3"]
+  private historyServerIsRostrum(): boolean {
+    return /^rostrum\b/i.test(this.historyClient?.versionInfo?.[0] ?? '');
   }
 
   // A history row carries the height of a confirmed transaction, so its block hash needs no Electrum lookup
   private async $getHistoryTransaction(row: IElectrumApi.ScriptHashHistory): Promise<IPublicApi.VerboseTransaction> {
-    const blockHash = row.height > 0 ? await this.$getBlockHash(row.height) : undefined;
-    return (await this.$getRawTransaction(row.tx_hash, false, true, false, blockHash)) as IPublicApi.VerboseTransaction;
+    return (await this.$getRawTransaction(
+      row.tx_hash,
+      false,
+      true,
+      false,
+      this.historyRowBlockHash(row)
+    )) as IPublicApi.VerboseTransaction;
+  }
+
+  private historyRowBlockHash(row: IElectrumApi.ScriptHashHistory): KnownBlockHash {
+    return row.height > 0 ? () => this.$getBlockHash(row.height) : '';
   }
 
   private async paginationKey(target: string, scriptHash: boolean): Promise<{ key: string; address: string }> {
@@ -477,8 +487,12 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
       const maxAttempts = Math.min(candidates.length, 3000);
       for (let j = 0; j < maxAttempts; j++) {
         const candidate = candidates[j];
-        // Get raw tx
-        const spenderTx = await this.electrumClient.blockchainTransaction_get(candidate.tx_hash, true);
+        // Get raw tx from the node, which needs the block of a confirmed candidate when it has no transaction index
+        const spenderTx: IBitcoinApi.VerboseTransaction = await this.$readTransaction(
+          candidate.tx_hash,
+          (hash) => this.bitcoindClient.getRawTransaction(candidate.tx_hash, 1, hash),
+          this.historyRowBlockHash(candidate)
+        );
         if (spenderTx && spenderTx.vin) {
           // TODO: Check also if the vout matches the input tx "vout" with this possible spender vin.vout number.
           // Currently however we do only submit the txid to the backend (and not yet the vout).
@@ -528,7 +542,8 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
     return this.electrumClient.blockchainScripthash_listunspent(scriptHash);
   }
 
-  private async $getConfirmedBlockHash(txId: string): Promise<string | undefined> {
+  // Asked only when the node has no transaction index and does not find the transaction without its block
+  protected async $findBlockHash(txId: string): Promise<string> {
     try {
       // Served by Fulcrum and Rostrum, which answer with an error for a mempool or unknown transaction
       const confirmed = await this.electrumClient.request('blockchain.transaction.get_confirmed_blockhash', [txId]);
@@ -536,9 +551,9 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
         return confirmed.block_hash;
       }
     } catch (e) {
-      // Read without a block hash, as a node with a transaction index does
+      // The node's own error is reported instead
     }
-    return undefined;
+    return '';
   }
 
   private $getScriptHashMempool(scriptHash: string): Promise<IElectrumApi.ScriptHashMempool[]> {
