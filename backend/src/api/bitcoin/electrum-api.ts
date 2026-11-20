@@ -7,10 +7,12 @@ import { createHash } from 'node:crypto';
 import { AbstractBitcoinApi } from './bitcoin-api-abstract-factory';
 import { IPublicApi } from './public-api.interface';
 import { IElectrumApi } from './electrum-api.interface';
+import { IBitcoinApi } from './bitcoin-api.interface';
 import BitcoinApi from './bitcoin-api';
 import logger from '../../logger';
 import loadingIndicators from '../loading-indicators';
 import memoryCache from '../memory-cache';
+import mempool from '../mempool';
 import { compareElectrumHistoryNewestFirst } from './electrum-history';
 
 class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
@@ -130,6 +132,27 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
     });
   }
 
+  async $getRawTransaction(
+    txId: string,
+    skipConversion = false,
+    addPrevout = false,
+    lazyPrevouts = false,
+    blockHash?: string
+  ): Promise<IPublicApi.VerboseTransaction | IBitcoinApi.VerboseTransaction> {
+    // A node without a transaction index finds a confirmed transaction only in its block, so ask the Electrum server
+    // for that block. Mempool transactions, and those the Electrum server cannot place, are read without a block hash.
+    if (blockHash === undefined && !mempool.getMempool()[txId]) {
+      blockHash = await this.$getConfirmedBlockHash(txId);
+    }
+    return super.$getRawTransaction(txId, skipConversion, addPrevout, lazyPrevouts, blockHash);
+  }
+
+  // A history row carries the height of a confirmed transaction, so its block hash needs no Electrum lookup
+  private async $getHistoryTransaction(row: IElectrumApi.ScriptHashHistory): Promise<IPublicApi.VerboseTransaction> {
+    const blockHash = row.height > 0 ? await this.$getBlockHash(row.height) : undefined;
+    return (await this.$getRawTransaction(row.tx_hash, false, true, false, blockHash)) as IPublicApi.VerboseTransaction;
+  }
+
   private async paginationKey(target: string, scriptHash: boolean): Promise<{ key: string; address: string }> {
     if (scriptHash) return { key: target, address: target };
     const info = await this.bitcoindClient.validateAddress(target);
@@ -160,7 +183,7 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
     const transactions: IPublicApi.VerboseTransaction[] = [];
     for (const row of 'rows' in page ? page.rows : []) {
       if (signal?.aborted) throw new Error('Request cancelled');
-      transactions.push((await this.$getRawTransaction(row.tx_hash, false, true)) as IPublicApi.VerboseTransaction);
+      transactions.push(await this.$getHistoryTransaction(row));
     }
     if ((await this.$getBlockHash(page.snapshotHeight)) !== page.snapshotHash)
       throw Object.assign(new Error('Address snapshot changed; restart pagination'), {
@@ -239,7 +262,7 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
       const endIndex = Math.min(startingIndex + 10, history.length);
 
       for (let i = startingIndex; i < endIndex; i++) {
-        const tx = (await this.$getRawTransaction(history[i].tx_hash, false, true)) as IPublicApi.VerboseTransaction;
+        const tx = await this.$getHistoryTransaction(history[i]);
         transactions.push(tx);
         loadingIndicators.setProgress('address-' + address, ((i + 1) / endIndex) * 100);
       }
@@ -362,7 +385,7 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
       const endIndex = Math.min(startingIndex + 10, history.length);
 
       for (let i = startingIndex; i < endIndex; i++) {
-        const tx = (await this.$getRawTransaction(history[i].tx_hash, false, true)) as IPublicApi.VerboseTransaction;
+        const tx = await this.$getHistoryTransaction(history[i]);
         transactions.push(tx);
         loadingIndicators.setProgress('address-' + scripthash, ((i + 1) / endIndex) * 100);
       }
@@ -503,6 +526,19 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
 
   private $getScriptHashUnspent(scriptHash: string): Promise<IElectrumApi.ScriptHashUtxos[]> {
     return this.electrumClient.blockchainScripthash_listunspent(scriptHash);
+  }
+
+  private async $getConfirmedBlockHash(txId: string): Promise<string | undefined> {
+    try {
+      // Served by Fulcrum and Rostrum, which answer with an error for a mempool or unknown transaction
+      const confirmed = await this.electrumClient.request('blockchain.transaction.get_confirmed_blockhash', [txId]);
+      if (typeof confirmed?.block_hash === 'string' && /^[a-f0-9]{64}$/i.test(confirmed.block_hash)) {
+        return confirmed.block_hash;
+      }
+    } catch (e) {
+      // Read without a block hash, as a node with a transaction index does
+    }
+    return undefined;
   }
 
   private $getScriptHashMempool(scriptHash: string): Promise<IElectrumApi.ScriptHashMempool[]> {

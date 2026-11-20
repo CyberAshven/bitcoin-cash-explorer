@@ -51,7 +51,8 @@ class BitcoinApi implements AbstractBitcoinApi {
     txId: string,
     skipConversion = false,
     addPrevout = false,
-    lazyPrevouts = false
+    lazyPrevouts = false,
+    blockHash = ''
   ): Promise<IPublicApi.VerboseTransaction | IBitcoinApi.VerboseTransaction> {
     // If the transaction is in the mempool we already converted and fetched the fee. Only prevouts are missing
     const txInMempool = mempool.getMempool()[txId];
@@ -59,9 +60,10 @@ class BitcoinApi implements AbstractBitcoinApi {
       return this.$addPrevouts(txInMempool);
     }
 
-    // This is using the convertTransaction with requires verbosity 2 + patterns, ignore blockhash argument (use an empty string)
+    // This is using the convertTransaction with requires verbosity 2 + patterns.
+    // Without a block hash (an empty string) a node finds a confirmed transaction only with a transaction index.
     return this.bitcoindClient
-      .getRawTransaction(txId, 2, '', true)
+      .getRawTransaction(txId, 2, blockHash, true)
       .then((transaction: IBitcoinApi.VerboseTransaction) => {
         if (skipConversion) {
           transaction.vout.forEach((vout) => {
