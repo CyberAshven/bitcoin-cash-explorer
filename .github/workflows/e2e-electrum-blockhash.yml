@@ -11,8 +11,8 @@ permissions:
   contents: read
 
 env:
-  NODE_VERSION: 26.13.0
-  PNPM_VERSION: 12.18.0
+  NODE_VERSION: 26.13.1
+  # Rust for the Rostrum build; the backend's addons pick theirs from rust/*/rust-toolchain
   RUST_VERSION: 1.98.1
   BCHN_VERSION: 29.2.0
   BCHN_SHA256: 23bbe9ff749136a9b832a2a59023ce76a5391322c1ea2f4f24b5b91f035081bc
@@ -30,9 +30,9 @@ jobs:
       matrix:
         include:
           - side: before
-            ref: 1382d9bde400f8b627504a66e8aaead8ec58c577
+            ref: a7f5198e01394267f97634a2726dc9b28b12c48b
           - side: after
-            ref: b21f4bd7635e844773c7a0361006dfd32edd27ae
+            ref: 2bd0b728358c5e98cff7fb692f0a8eb63c4e0252
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,8 +49,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
       - name: Install pnpm and Rust
         run: |
-          npm install -g "pnpm@$PNPM_VERSION"
-          rustup toolchain install "$RUST_VERSION" --profile minimal
+          npm install -g "pnpm@$(node -p 'require("./backend/package.json").packageManager.split("@")[1]')"
+          for toolchain in $(cat rust/*/rust-toolchain | sort -u); do
+            rustup toolchain install "$toolchain" --profile minimal
+          done
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -58,7 +60,7 @@ jobs:
             ~/.cargo/git
             rust/gbt/target
             rust/filter-scan/target
-          key: native-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('rust/*/Cargo.lock') }}
+          key: native-${{ runner.os }}-${{ hashFiles('rust/*/rust-toolchain', 'rust/*/Cargo.lock') }}
       - name: Build
         env:
           MEMPOOL_COMMIT_HASH: ${{ matrix.ref }}
@@ -182,7 +184,7 @@ jobs:
               for line in open(path):
                   server, side, name, status, verdict = line.rstrip('\n').split('\t')
                   rows.setdefault((server, name), {})[side] = f'{status} {verdict}'.strip()
-          print('| Electrum server | Route | Before (main 1382d9bd) | After (b21f4bd7) |')
+          print('| Electrum server | Route | Before (feat/p2p-light-client a7f5198e) | After (2bd0b728) |')
           print('|---|---|---|---|')
           for (server, name), sides in rows.items():
               print(f"| {server} | {name} | {sides.get('before', '')} | {sides.get('after', '')} |")
