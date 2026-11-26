@@ -78,9 +78,9 @@ Query OK, 0 rows affected (0.00 sec)
 
 #### Build
 
-_Use Node.js 26.13.0 or newer in the 26.x LTS series and the pinned [pnpm 12.18.0](https://pnpm.io/installation) from `package.json`. CI uses Node.js 26.13.0._
+_Use Node.js 26.13.0 or newer in the 26.x LTS series and the pinned [pnpm 12.21.0](https://pnpm.io/installation) from `package.json`. CI uses Node.js 26.13.1._
 
-Use [nvm](https://github.com/nvm-sh/nvm#installing-and-updating) for local development. From the repository root, run `nvm install` and `nvm use`; the root `.nvmrc` selects Node.js 26.13.0.
+Use [nvm](https://github.com/nvm-sh/nvm#installing-and-updating) for local development. From the repository root, run `nvm install` and `nvm use`; the root `.nvmrc` selects Node.js 26.13.1.
 
 _The build process requires [Rust](https://www.rust-lang.org/tools/install) to be installed._
 
@@ -340,3 +340,24 @@ the `EXPLORER_` prefix; see [Docker configuration](../docker/README.md).
 Set `EXPLORER.UNIX_SOCKET_PATH` to serve the backend API and WebSocket endpoint over a local Unix socket in addition to its TCP port. Leave it empty to use TCP only. This setting is separate from BCHN RPC connection pooling and the Valkey socket configuration.
 
 Use a directory owned by the backend service account, writable only by trusted administrators and that account. Before starting listeners or cluster workers, the primary process probes an existing socket for up to one second. It removes a stale socket only after connection refusal and an unchanged filesystem identity. An active listener, regular file, symlink, timeout, or permission error stops startup with a diagnostic; resolve that condition before restarting. The service does not create the parent directory or remove arbitrary files.
+
+### Speed up mempool history
+
+To speed up charts from one month through all time, run this once per network from the built backend directory, using the same configuration as the running service:
+
+```sh
+pnpm statistics:buckets:activate
+```
+
+For Docker, run it in the backend container for that network. This example uses Chipnet:
+
+```sh
+docker exec -w /backend/package bch-explorer-api-chipnet pnpm statistics:buckets:activate
+```
+
+The command builds and checks the summaries before switching charts to them. If interrupted, run it again to resume. The backend keeps summaries up to date as new samples arrive.
+
+- Check progress with `pnpm statistics:buckets:status`.
+- Switch back to raw history with `pnpm statistics:buckets:disable`.
+
+If an older backend collected samples during a downgrade, the current backend falls back to raw history. To rebuild, stop all backend processes and statistics tasks for that database. Run `pnpm statistics:buckets:reset` using the current backend and its database configuration. Then start the current backend and run activation again.
